@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Compact summary of what this GDAL build can do.
+
+usage: gdalcaps [--details] [--all] [--json]
+
+  (default)  version, libs, driver counts, codecs, cloud/archive/reference access
+  --details  also list drivers that exist because an optional library was found
+             (read from GDAL's source tree: $GDAL_SRC, default ~/gdal)
+  --all      also list the remaining drivers (built-in long tail)
+  --json     emit JSON instead of text
+"""
+import json, os, re, sys
+from pathlib import Path
+from osgeo import gdal
+
+gdal.UseExceptions()
+SRC = Path(os.environ.get("GDAL_SRC", "~/gdal")).expanduser()
+BUILD = Path(os.environ.get("GDAL_BUILD", SRC / "build"))
+
+# Libraries nearly every GDAL has; drivers needing only these are not "less usual".
+COMMON_LIBS = {"curl", "sqlite3", "expat", "tiff", "geotiff", "jpeg", "png", "gif", "zlib", "lerc", "opencad"}
+# Drivers whose optional library is wired in below the top-level declarations.
+EXTRA = {"PDF": ["POPPLER", "PDFIUM", "PODOFO"]}
+
+
+def drivers():
+    out = []
+    for i in range(gdal.GetDriverCount()):
+        d = gdal.GetDriver(i)
+        md = d.GetMetadata() or {}
+        scopes = [s for s, k in (("raster", "DCAP_RASTER"), ("vector", "DCAP_VECTOR"),
+                                 ("mdim", "DCAP_MULTIDIM_RASTER")) if md.get(k) == "YES"]
+        write = any(md.get(k) == "YES" for k in ("DCAP_CREATE", "DCAP_CREATECOPY",
+                                                  "DCAP_CREATE_MULTIDIMENSIONAL"))
+        out.append(dict(name=d.ShortName, long=d.LongName, scopes=scopes, write=write))
+    return out
+
+
+def co_values(drv, option):
+    d = gdal.GetDriverByName(drv)
+    xml = (d and d.GetMetadataItem("DMD_CREATIONOPTIONLIST")) or ""
+    m = re.search(rf"name=[\"']{option}[\"'].*?</Option>", xml, re.S)
+    return re.findall(r"<Value[^>]*>([^<]+)</Value>", m.group(0)) if m else []
+
+
+def cmake_on():
+    """GDAL_USE_* options that are ON in the build's CMakeCache (empty if no build dir)."""
+    cache = BUILD / "CMakeCache.txt"
+    if not cache.exists():
+        return None
+    return set(re.findall(r"^GDAL_USE_(\w+):BOOL=ON", cache.read_text(), re.M))
+
+
+def lib_label(cond, on):
+    """'GDAL_USE_TIFF OR GDAL_USE_TIFF_INTERNAL;GDAL_USE_HDF5' -> ['tiff (internal)', 'hdf5']"""
+    libs = []
+    for group in cond.split(";"):
+        alts = re.findall(r"GDAL_USE_(\w+)", group)
+        if not alts:
+            continue  # driver-on-driver condition, not a library
+        # the driver exists, so some alternative held; if the cache doesn't say which, the vendored copy did
+        pick = next((a for a in alts if on and a in on), None) or \
+            next((a for a in alts if a.endswith("_INTERNAL")), alts[0])
+        libs.append(pick.lower().replace("_internal", " (internal)"))
+    return libs
+
+
+def optional_lib_drivers():
+    """{driver short name: [libs]} for drivers gated on an optional library in the source tree."""
+    if not (SRC / "frmts").is_dir():
+        return None
+    on = cmake_on()
+    files = [SRC / "frmts/CMakeLists.txt", SRC / "ogr/ogrsf_frmts/CMakeLists.txt",
+             *SRC.glob("frmts/*/driver_declaration.cmake"), *SRC.glob("ogr/ogrsf_frmts/*/driver_declaration.cmake")]
+    decl = re.compile(r"^\s*(gdal_dependent_format|ogr_dependent_driver)\((\w+)\s+(?:\"[^\"]*\"|\S+)\s+\"([^\"]+)\"", re.M)
+    name_pat = re.compile(r'DRIVER_NAME\s*=?\s*"([^"]+)"|SetDescription\("([^"]+)"\)')
+    present = {d["name"] for d in drivers()}
+    lower = {n.lower(): n for n in present}
+    result = {}
+    for f in files:
+        for kind, dirname, cond in decl.findall(f.read_text()):
+            libs = lib_label(cond, on)
+            if not libs:
+                continue
+            ddir = SRC / ("frmts" if kind.startswith("gdal") else "ogr/ogrsf_frmts") / dirname
+            names = set()
+            for src in list(ddir.glob("*.h")) + list(ddir.glob("*.cpp")):
+                for a, b in name_pat.findall(src.read_text(errors="ignore")):
+                    names.add(a or b)
+            names = {n for n in names if n in present} or ({lower[dirname]} if dirname in lower else set())
+            for n in names:
+                result[n] = libs
+    for n, alts in EXTRA.items():
+        hit = [a.lower() for a in alts if on and a in on]
+        if n in present and hit:
+            result[n] = hit
+    return result
+
+
+def summary():
+    build = dict(l.split("=", 1) for l in gdal.VersionInfo("BUILD_INFO").splitlines() if "=" in l)
+    drv = drivers()
+    count = lambda f: sum(1 for d in drv if f(d))
+    vsi = [p.strip("/?").removeprefix("vsi") for p in gdal.GetFileSystemsPrefixes()]
+    cloud = sorted({v.removesuffix("_streaming") for v in vsi} &
+                   {"s3", "gs", "az", "adls", "oss", "swift", "webhdfs", "curl"})
+    zarr = gdal.GetDriverByName("Zarr")
+    zmd = (zarr.GetMetadata() or {}) if zarr else {}
+    return dict(
+        gdal=gdal.__version__,
+        libs={k.removesuffix("_VERSION").removesuffix("_RUNTIME").lower(): v
+              for k, v in build.items() if k.endswith("VERSION") and "BUILD" not in k},
+        drivers=dict(total=len(drv), raster=count(lambda d: "raster" in d["scopes"]),
+                     vector=count(lambda d: "vector" in d["scopes"]),
+                     mdim=count(lambda d: "mdim" in d["scopes"]), writable=count(lambda d: d["write"])),
+        tiff_compress=co_values("GTiff", "COMPRESS"),
+        zarr=dict(compressors=[c for c in zmd.get("COMPRESSORS", "").split(",") if c],
+                  pcodec=zmd.get("HAVE_PCODEC") == "YES") if zarr else None,
+        cloud=cloud,
+        archives=[v for v in vsi if v in ("zip", "tar", "gzip", "7z", "rar")],
+        refs=[v for v in vsi if v.startswith(("kerchunk", "icechunk", "pmtiles"))],
+    )
+
+
+def tag(d):
+    return "M" if "mdim" in d["scopes"] else "R" if "raster" in d["scopes"] else "V"
+
+
+def split_drivers():
+    opt = optional_lib_drivers()
+    if opt is None:
+        return None, None
+    usual, rest = [], []
+    for d in drivers():
+        libs = opt.get(d["name"])
+        if libs and not set(l.removesuffix(" (internal)") for l in libs) <= COMMON_LIBS and \
+                not all(l.endswith("(internal)") for l in libs):
+            usual.append(dict(d, libs=libs))
+        else:
+            rest.append(d)
+    return usual, rest
+
+
+def show(s, details, all_):
+    d = s["drivers"]
+    print(f"GDAL {s['gdal']}   " + "  ".join(f"{k} {v}" for k, v in s["libs"].items()))
+    print(f"drivers  {d['total']} ({d['raster']} raster, {d['vector']} vector, {d['mdim']} mdim; {d['writable']} writable)")
+    print(f"tiff     {' '.join(s['tiff_compress'])}")
+    if s["zarr"]:
+        print(f"zarr     {' '.join(s['zarr']['compressors'])}" + (" +pcodec" if s["zarr"]["pcodec"] else ""))
+    print(f"cloud    {' '.join(s['cloud'])}")
+    print(f"archive  {' '.join(s['archives'])}")
+    print(f"refs     {' '.join(s['refs']) or '-'}")
+    if not (details or all_):
+        return
+    usual, rest = split_drivers()
+    if usual is None:
+        print(f"\n(no GDAL source tree at {SRC}; set GDAL_SRC for --details)")
+        return
+    print(f"\nfrom optional libraries ({len(usual)}; M=mdim R=raster V=vector, * writable):")
+    for t in "MRV":
+        rows = sorted((x for x in usual if tag(x) == t), key=lambda x: x["name"].lower())
+        for x in rows:
+            print(f"  {t} {x['name'] + ('*' if x['write'] else ''):<16} {', '.join(x['libs'])}")
+    if all_:
+        print(f"\nother drivers ({len(rest)}):")
+        for t in "MRV":
+            names = sorted((x["name"] + ("*" if x["write"] else "") for x in rest if tag(x) == t), key=str.lower)
+            if names:
+                print(f"  {t}  " + " ".join(names))
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(__doc__.strip())
+        sys.exit(0)
+    details, all_ = "--details" in args, "--all" in args
+    s = summary()
+    if "--json" in args:
+        if details or all_:
+            usual, rest = split_drivers()
+            s["optional_lib_drivers"] = usual
+            if all_:
+                s["other_drivers"] = rest
+        print(json.dumps(s, indent=1))
+    else:
+        show(s, details, all_)

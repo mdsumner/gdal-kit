@@ -1,0 +1,28 @@
+#!/bin/sh
+# mdim-summary: compact, structural summary of a multidimensional dataset.
+#
+#   mdim-summary FILE [gdal mdim info options...]
+#   gdal mdim info --format=json FILE | mdim-summary   (or: mdim-summary -)
+#
+# Thin wrapper around share/gdal-kit/mdim-summary.jq; the JSON from
+# `gdal mdim info` is the contract, this is a way to read it.
+set -e
+here=$(cd "$(dirname "$0")" && pwd)
+jqf=${MDIM_SUMMARY_JQ:-}
+for c in "$here/../share/gdal-kit/mdim-summary.jq" "$here/mdim-summary.jq"; do
+  [ -z "$jqf" ] && [ -f "$c" ] && jqf=$c
+done
+[ -n "$jqf" ] || { echo "mdim-summary: cannot find mdim-summary.jq (set MDIM_SUMMARY_JQ)" >&2; exit 1; }
+command -v jq >/dev/null || { echo "mdim-summary: jq is required" >&2; exit 1; }
+
+case "${1:-}" in
+  -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  ""|-) exec jq -rf "$jqf" ;;
+esac
+if command -v gdal >/dev/null && gdal mdim info --help >/dev/null 2>&1; then
+  # GDAL >= 3.14 defaults to text output; ask for JSON when the option exists
+  fmt=; gdal mdim info --help 2>&1 | grep -q 'OUTPUT-FORMAT' && fmt="--format=json"
+  gdal mdim info $fmt "$@" | jq -rf "$jqf"
+else
+  gdalmdiminfo "$@" | jq -rf "$jqf"   # GDAL < 3.11: same JSON shape
+fi

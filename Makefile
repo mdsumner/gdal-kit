@@ -3,9 +3,9 @@ BINDIR  = $(PREFIX)/bin
 SHAREDIR = $(PREFIX)/share/gdal-kit
 
 BIN   = gdalcaps mdim-summary
-SHARE = mdim-summary.jq
+SHARE = mdim-summary.jq driver-libs.json
 
-.PHONY: install uninstall check
+.PHONY: install uninstall check snapshot
 
 install:
 	install -d $(BINDIR) $(SHAREDIR)
@@ -21,3 +21,7 @@ uninstall:
 check:
 	python3 bin/gdalcaps >/dev/null && echo "gdalcaps ok"
 	command -v jq >/dev/null && echo '{"name":"/","driver":"MEM"}' | bin/mdim-summary | grep -q "gdal.mdim" && echo "mdim-summary ok"
+
+# refresh share/gdal-kit/driver-libs.json from a GDAL source tree (default ~/gdal)
+snapshot:
+	python3 bin/gdalcaps --write-snapshot

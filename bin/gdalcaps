@@ -5,11 +5,12 @@ usage: gdalcaps [--details] [--all] [--json]
 
   (default)  version, libs, driver counts, codecs, cloud/archive/reference access
   --details  also list drivers that exist because an optional library was found
-             (read from GDAL's source tree: $GDAL_SRC, default ~/gdal)
+             (from GDAL's source tree, $GDAL_SRC default ~/gdal, else a
+             snapshot shipped with gdal-kit; refresh it with --write-snapshot)
   --all      also list the remaining drivers (built-in long tail)
   --json     emit JSON instead of text
 """
-import json, os, re, sys
+import json, os, re, shutil, sys
 from pathlib import Path
 from osgeo import gdal
 
@@ -19,7 +20,8 @@ BUILD = Path(os.environ.get("GDAL_BUILD", SRC / "build"))
 
 # Libraries nearly every GDAL has; drivers needing only these are not "less usual".
 COMMON_LIBS = {"curl", "sqlite3", "expat", "tiff", "geotiff", "jpeg", "png", "gif", "zlib", "lerc", "opencad"}
-# Drivers whose optional library is wired in below the top-level declarations.
+# Drivers whose optional library is wired in below the top-level declarations;
+# they report the backend in driver metadata as HAVE_<LIB>=YES.
 EXTRA = {"PDF": ["POPPLER", "PDFIUM", "PODOFO"]}
 
 
@@ -65,35 +67,66 @@ def lib_label(cond, on):
     return libs
 
 
-def optional_lib_drivers():
-    """{driver short name: [libs]} for drivers gated on an optional library in the source tree."""
-    if not (SRC / "frmts").is_dir():
-        return None
-    on = cmake_on()
-    files = [SRC / "frmts/CMakeLists.txt", SRC / "ogr/ogrsf_frmts/CMakeLists.txt",
-             *SRC.glob("frmts/*/driver_declaration.cmake"), *SRC.glob("ogr/ogrsf_frmts/*/driver_declaration.cmake")]
+SNAPSHOT = Path(__file__).resolve().parent.parent / "share/gdal-kit/driver-libs.json"
+
+
+def source_map(src):
+    """{candidate driver name: cmake condition} parsed from a GDAL source tree."""
+    files = [src / "frmts/CMakeLists.txt", src / "ogr/ogrsf_frmts/CMakeLists.txt",
+             *src.glob("frmts/*/driver_declaration.cmake"), *src.glob("ogr/ogrsf_frmts/*/driver_declaration.cmake")]
     decl = re.compile(r"^\s*(gdal_dependent_format|ogr_dependent_driver)\((\w+)\s+(?:\"[^\"]*\"|\S+)\s+\"([^\"]+)\"", re.M)
     name_pat = re.compile(r'DRIVER_NAME\s*=?\s*"([^"]+)"|SetDescription\("([^"]+)"\)')
-    present = {d["name"] for d in drivers()}
-    lower = {n.lower(): n for n in present}
-    result = {}
+    out = {}
     for f in files:
         for kind, dirname, cond in decl.findall(f.read_text()):
-            libs = lib_label(cond, on)
-            if not libs:
-                continue
-            ddir = SRC / ("frmts" if kind.startswith("gdal") else "ogr/ogrsf_frmts") / dirname
-            names = set()
-            for src in list(ddir.glob("*.h")) + list(ddir.glob("*.cpp")):
-                for a, b in name_pat.findall(src.read_text(errors="ignore")):
-                    names.add(a or b)
-            names = {n for n in names if n in present} or ({lower[dirname]} if dirname in lower else set())
+            if "GDAL_USE_" not in cond:
+                continue  # gated only on other drivers
+            ddir = src / ("frmts" if kind.startswith("gdal") else "ogr/ogrsf_frmts") / dirname
+            names = {dirname}
+            for c in list(ddir.glob("*.h")) + list(ddir.glob("*.cpp")):
+                for x, y in name_pat.findall(c.read_text(errors="ignore")):
+                    names.add(x or y)
             for n in names:
-                result[n] = libs
+                out.setdefault(n, cond)
     for n, alts in EXTRA.items():
-        hit = [a.lower() for a in alts if on and a in on]
-        if n in present and hit:
-            result[n] = hit
+        out[n] = " OR ".join("GDAL_USE_" + x for x in alts)
+    return out
+
+
+def driver_map():
+    """(map, origin): from $GDAL_SRC if present, else the snapshot shipped with gdal-kit."""
+    if (SRC / "frmts").is_dir():
+        return source_map(SRC), str(SRC)
+    if SNAPSHOT.exists():
+        snap = json.loads(SNAPSHOT.read_text())
+        return snap["drivers"], f"snapshot of GDAL {snap['gdal']}"
+    return None, None
+
+
+def optional_lib_drivers():
+    """{driver short name: [libs]} for present drivers gated on an optional library."""
+    m, _ = driver_map()
+    if m is None:
+        return None
+    on = cmake_on()
+    lower = {k.lower(): v for k, v in m.items()}
+    result = {}
+    for d in drivers():
+        cond = m.get(d["name"])
+        if cond is None and d["name"].lower() in lower and d["name"] not in EXTRA:
+            cond = lower[d["name"].lower()]  # source directory name, e.g. "heif" -> HEIF
+        if cond is None:
+            continue
+        if d["name"] in EXTRA:
+            # these drivers say which backend they were built with, e.g. PDF: HAVE_POPPLER=YES
+            md = gdal.GetDriverByName(d["name"]).GetMetadata() or {}
+            libs = [x.lower() for x in EXTRA[d["name"]] if md.get("HAVE_" + x) == "YES"]
+            if libs:
+                result[d["name"]] = libs
+            continue
+        libs = lib_label(cond, on)
+        if libs:
+            result[d["name"]] = libs
     return result
 
 
@@ -141,39 +174,95 @@ def split_drivers():
     return usual, rest
 
 
+def width():
+    return min(shutil.get_terminal_size((100, 24)).columns, 100)
+
+
+def wrap(label, items, sep="  ", indent=2, col=12):
+    """'  label     a  b  c' with continuation lines under the first item.
+    Wraps between items only, so names containing spaces stay whole."""
+    lead = " " * indent + label.ljust(col - indent)
+    lines, cur = [], lead
+    for it in items:
+        add = it if cur == lead else sep + it
+        if cur != lead and len(cur) + len(add) > width():
+            lines.append(cur)
+            cur, add = " " * col, it
+        cur += add
+    lines.append(cur)
+    return "\n".join(lines)
+
+
+CLOUD_ORDER = ["s3", "gs", "az", "adls", "oss", "swift", "webhdfs", "curl"]
+ARCHIVE_ORDER = ["zip", "tar", "gzip", "7z", "rar"]
+
+
+def refs_display(refs):
+    """kerchunk_json_ref, kerchunk_json_ref_cached, ... -> kerchunk (json, json cached, parquet)"""
+    out, kc = [], []
+    for r in refs:
+        if r.startswith("kerchunk_"):
+            kc.append(r.removeprefix("kerchunk_").replace("_ref", "").replace("_", " "))
+        else:
+            out.append(r)
+    if kc:
+        out.insert(min(1, len(out)), f"kerchunk ({', '.join(kc)})")
+    return out
+
+
 def show(s, details, all_):
     d = s["drivers"]
-    print(f"GDAL {s['gdal']}   " + "  ".join(f"{k} {v}" for k, v in s["libs"].items()))
-    print(f"drivers  {d['total']} ({d['raster']} raster, {d['vector']} vector, {d['mdim']} mdim; {d['writable']} writable)")
-    print(f"tiff     {' '.join(s['tiff_compress'])}")
+    dot = " · "
+    libs = [f"{k} {v.split('-')[0]}" for k, v in sorted(
+        s["libs"].items(), key=lambda kv: (["proj", "geos", "curl"] + [kv[0]]).index(kv[0]))]
+    print(f"GDAL {s['gdal']}")
+    print()
+    print(wrap("libs", [dot.join(libs)]))
+    print(wrap("drivers", [f"{d['total']} total{dot}{d['raster']} raster{dot}{d['vector']} vector"
+                           f"{dot}{d['mdim']} mdim{dot}{d['writable']} writable"]))
+    print()
+    print(wrap("tiff", s["tiff_compress"], sep=" "))
     if s["zarr"]:
-        print(f"zarr     {' '.join(s['zarr']['compressors'])}" + (" +pcodec" if s["zarr"]["pcodec"] else ""))
-    print(f"cloud    {' '.join(s['cloud'])}")
-    print(f"archive  {' '.join(s['archives'])}")
-    print(f"refs     {' '.join(s['refs']) or '-'}")
+        print(wrap("zarr", s["zarr"]["compressors"] + (["+ pcodec"] if s["zarr"]["pcodec"] else []), sep=" "))
+    print()
+    print(wrap("cloud", sorted(s["cloud"], key=CLOUD_ORDER.index), sep=" "))
+    print(wrap("archive", sorted(s["archives"], key=ARCHIVE_ORDER.index), sep=" "))
+    print(wrap("refs", refs_display(s["refs"]) or ["-"], sep=dot))
     if not (details or all_):
         return
     usual, rest = split_drivers()
     if usual is None:
-        print(f"\n(no GDAL source tree at {SRC}; set GDAL_SRC for --details)")
+        print(f"\n(no GDAL source tree at {SRC} and no snapshot; set GDAL_SRC for --details)")
         return
-    print(f"\nfrom optional libraries ({len(usual)}; M=mdim R=raster V=vector, * writable):")
-    for t in "MRV":
-        rows = sorted((x for x in usual if tag(x) == t), key=lambda x: x["name"].lower())
-        for x in rows:
-            print(f"  {t} {x['name'] + ('*' if x['write'] else ''):<16} {', '.join(x['libs'])}")
+    star = lambda x: x["name"] + ("*" if x["write"] else "")
+    print()
+    print(f"drivers from optional libraries ({len(usual)}; * = writable)")
+    bylib = {}
+    for x in usual:
+        bylib.setdefault(", ".join(x["libs"]), []).append(x)
+    for lib in sorted(bylib, key=str.lower):
+        print(wrap(lib, [star(x) for x in sorted(bylib[lib], key=lambda x: x["name"].lower())],
+                   col=max(14, len(lib) + 4)))
     if all_:
-        print(f"\nother drivers ({len(rest)}):")
-        for t in "MRV":
-            names = sorted((x["name"] + ("*" if x["write"] else "") for x in rest if tag(x) == t), key=str.lower)
+        print()
+        print(f"other drivers ({len(rest)})")
+        for t, label in (("M", "multidim"), ("R", "raster"), ("V", "vector")):
+            names = sorted((star(x) for x in rest if tag(x) == t), key=str.lower)
             if names:
-                print(f"  {t}  " + " ".join(names))
+                print(wrap(label, names, col=14))
 
 
 if __name__ == "__main__":
     args = sys.argv[1:]
     if "-h" in args or "--help" in args:
         print(__doc__.strip())
+        sys.exit(0)
+    if "--write-snapshot" in args:
+        if not (SRC / "frmts").is_dir():
+            sys.exit(f"gdalcaps: no GDAL source tree at {SRC} (set GDAL_SRC)")
+        SNAPSHOT.write_text(json.dumps({"gdal": gdal.__version__, "source": "frmts/ and ogr/ogrsf_frmts/ cmake declarations",
+                                        "drivers": dict(sorted(source_map(SRC).items()))}, indent=1) + "\n")
+        print(f"wrote {SNAPSHOT}")
         sys.exit(0)
     details, all_ = "--details" in args, "--all" in args
     s = summary()
